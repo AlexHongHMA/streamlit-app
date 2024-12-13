@@ -1,116 +1,131 @@
-import streamlit as st
 import cv2
-import tempfile
 import numpy as np
 import tensorflow as tf
-from tensorflow.keras.models import load_model
+import streamlit as st
+import tempfile
+import os
 
-# Load Pre-trained Models
+# Define categories for classification
+BINARY_CATEGORIES = ['No Leak', 'Leak']
+THREE_CLASS_CATEGORIES = ['Small', 'Medium', 'Large']
+
+# Define paths for models
+BINARY_MODEL_PATH = "models/gas_leak_3dcnn_final.h5"
+THREE_CLASS_MODEL_PATH = "models/3Class_gas_leak_3dcnn_final.h5"
+
+# Load models
 @st.cache_resource
 def load_binary_model():
-    return load_model("binary_classification_model.h5")  # Replace with your binary classification model path
+    model = tf.keras.models.load_model(BINARY_MODEL_PATH)
+    return model
 
 @st.cache_resource
 def load_three_class_model():
-    return load_model("three_class_classification_model.h5")  # Replace with your three-class model path
+    model = tf.keras.models.load_model(THREE_CLASS_MODEL_PATH)
+    return model
 
-# Preprocess Video with MOG2 Background Subtraction
-def preprocess_video_mog2(video_path, frame_shape=(15, 240, 320, 1)):
+def preprocess_frame(frame, bg_subtractor, gaussian_kernel_size=(7, 7)):
+    """
+    Preprocess a single frame for the model:
+    1. Convert to grayscale
+    2. Apply Gaussian blur
+    3. Apply MOG2 background subtraction
+    4. Normalize and reshape
+    """
+    gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    gray_frame = cv2.GaussianBlur(gray_frame, gaussian_kernel_size, 0)
+    foreground = bg_subtractor.apply(gray_frame)
+    _, foreground = cv2.threshold(foreground, 5, 255, cv2.THRESH_BINARY)
+    normalized_frame = foreground / 255.0
+    return normalized_frame.reshape(240, 320, 1)
+
+def process_video_with_labels(video_path, output_path, model, categories, frame_size=(240, 320, 1), sliding_window_size=15):
+    """
+    Process video frame by frame, classify with the model, and save a new video with predictions overlaid.
+    """
     cap = cv2.VideoCapture(video_path)
-    frames = []
+    if not cap.isOpened():
+        st.error("Error opening video file.")
+        return
 
-    # Initialize MOG2 background subtractor
+    # Initialize video writer
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    # Initialize background subtractor
     bg_subtractor = cv2.createBackgroundSubtractorMOG2(history=200, varThreshold=16, detectShadows=False)
+    frames_buffer = []
 
-    while cap.isOpened():
+    while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        # Convert to grayscale and resize to model's input shape
-        gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        resized_frame = cv2.resize(gray_frame, (frame_shape[2], frame_shape[1]))
+        # Preprocess the current frame
+        preprocessed_frame = preprocess_frame(frame, bg_subtractor)
+        frames_buffer.append(preprocessed_frame)
 
-        # Apply MOG2 background subtraction
-        foreground = bg_subtractor.apply(resized_frame)
+        # When the buffer has enough frames, make a prediction
+        if len(frames_buffer) == sliding_window_size:
+            input_data = np.expand_dims(frames_buffer, axis=0)  # Add batch dimension
+            prediction = model.predict(input_data, verbose=0)
+            predicted_class = np.argmax(prediction)
+            label = categories[predicted_class]
 
-        # Threshold the foreground
-        _, foreground = cv2.threshold(foreground, 5, 255, cv2.THRESH_BINARY)
+            # Draw the label on the frame
+            cv2.putText(frame, f"Prediction: {label}", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
 
-        # Normalize and append
-        normalized_frame = foreground / 255.0
-        frames.append(normalized_frame)
+            # Slide the window
+            frames_buffer.pop(0)
+
+        # Write the frame with the label to the output video
+        out.write(frame)
 
     cap.release()
+    out.release()
 
-    # Create video segments of required shape
-    frame_count = len(frames)
-    segments = []
+# Streamlit App
+def main():
+    st.title("Gas Leak Classification (Real-Time with Labels)")
+    st.write("Upload a video to classify gas leaks in real time with predictions displayed on the video.")
 
-    for i in range(0, frame_count - frame_shape[0] + 1, frame_shape[0]):
-        segment = frames[i:i + frame_shape[0]]
-        segment = np.array(segment).reshape(frame_shape)
-        segments.append(segment)
+    # Classification mode selection
+    classification_mode = st.selectbox(
+        "Select Classification Mode",
+        ("Binary Classification (Leak/No Leak)", "Three-Class Classification (Small/Medium/Large)")
+    )
 
-    return np.array(segments)
+    # File uploader
+    uploaded_video = st.file_uploader("Upload a video file (MP4, AVI)", type=["mp4", "avi"])
 
-# Predict Class Labels
-def predict_binary(model, video_segments):
-    predictions = model.predict(video_segments)
-    return np.argmax(predictions, axis=1)  # 0 for no_leak, 1 for leak
+    if uploaded_video is not None:
+        # Save the uploaded video to a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
+            temp_video.write(uploaded_video.read())
+            temp_video_path = temp_video.name
 
-def predict_three_class(model, video_segments):
-    predictions = model.predict(video_segments)
-    return np.argmax(predictions, axis=1)  # 0 for small, 1 for medium, 2 for large
+        st.video(temp_video_path)
+        st.write("Processing video...")
 
-# Streamlit Web App
-st.title("Video Classification Web App with MOG2 Preprocessing")
-st.write("Upload a video to classify using the trained models.")
+        if classification_mode == "Binary Classification (Leak/No Leak)":
+            model = load_binary_model()
+            categories = BINARY_CATEGORIES
+        else:
+            model = load_three_class_model()
+            categories = THREE_CLASS_CATEGORIES
 
-# Classification Mode Selection
-classification_mode = st.selectbox(
-    "Select Classification Mode",
-    ("Binary Classification (Leak/No Leak)", "Three-Class Classification (Small/Medium/Large)")
-)
+        # Save processed video to a temporary file
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_output:
+            output_video_path = temp_output.name
 
-# File Uploader
-uploaded_video = st.file_uploader("Upload a video file (MP4)", type=["mp4", "avi", "mov"])
+        # Process the video and add predictions
+        process_video_with_labels(temp_video_path, output_video_path, model, categories)
 
-if uploaded_video is not None:
-    # Save uploaded video to a temporary file
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as temp_video:
-        temp_video.write(uploaded_video.read())
-        temp_video_path = temp_video.name
+        st.write("Processed video with predictions:")
+        st.video(output_video_path)
 
-    st.video(temp_video_path)
-    st.write("Video uploaded successfully! Processing...")
-
-    # Preprocess Video with MOG2
-    frame_shape = (15, 240, 320, 1)
-    video_segments = preprocess_video_mog2(temp_video_path, frame_shape)
-
-    if classification_mode == "Binary Classification (Leak/No Leak)":
-        model = load_binary_model()
-        predictions = predict_binary(model, video_segments)
-        class_counts = {"No Leak": np.sum(predictions == 0), "Leak": np.sum(predictions == 1)}
-
-        st.write("**Binary Classification Results:**")
-        st.write(class_counts)
-
-    elif classification_mode == "Three-Class Classification (Small/Medium/Large)":
-        model = load_three_class_model()
-        predictions = predict_three_class(model, video_segments)
-        class_counts = {
-            "Small Leak": np.sum(predictions == 0),
-            "Medium Leak": np.sum(predictions == 1),
-            "Large Leak": np.sum(predictions == 2),
-        }
-
-        st.write("**Three-Class Classification Results:**")
-        st.write(class_counts)
-
-    # Display Predictions Summary
-    st.write("**Processed Segments:**")
-    st.write(f"Total Segments Processed: {len(video_segments)}")
-else:
-    st.write("Please upload a video file to proceed.")
+if __name__ == "__main__":
+    main()
