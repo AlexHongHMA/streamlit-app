@@ -27,13 +27,17 @@ def preprocess_frame(frame, background_frames, background_window):
 
     background_frames.append(gray_frame)
 
-    if len(background_frames) == background_window:
-        background = np.median(np.array(background_frames), axis=0).astype(np.uint8)
+    # Compute the background using the median of the deque
+    if len(background_frames) < 210:
+        temp_background = np.mean(background_frames, axis=0).astype(np.uint8)
+        foreground = cv2.absdiff(gray_frame, temp_background)
     else:
-        background = gray_frame
+    # Median background once buffer is full
+        median_background = np.median(np.array(background_frames), axis=0).astype(np.uint8)
+        foreground = cv2.absdiff(gray_frame, median_background)
 
-    foreground = cv2.absdiff(gray_frame, background)
-    _, foreground = cv2.threshold(foreground, 5, 255, cv2.THRESH_BINARY)
+                # Apply a threshold to the foreground
+    _, foreground = cv2.threshold(foreground, 15, 255, cv2.THRESH_BINARY)
     normalized_frame = foreground / 255.0  # Normalize to [0, 1]
     return normalized_frame
 
@@ -49,16 +53,20 @@ def classify_video(video_path, model, frame_shape, num_frames, class_labels):
     output_video_path = tempfile.NamedTemporaryFile(delete=False, suffix=".mp4").name
     out = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (width, height))
 
-    background_frames = deque(maxlen=50)
+    background_frames = deque(maxlen=210)
     frames = []
     predictions = []
+
+    # Font colors for binary and three-class
+    binary_colors = {"No Leak": (255, 255, 255), "Leak": (0, 255, 0)}  # White and Green
+    three_class_colors = {"Small": (0, 255, 255), "Medium": (0, 165, 255), "Large": (0, 0, 255)}  # Yellow, Orange, Red
 
     while True:
         ret, frame = cap.read()
         if not ret:
             break
 
-        processed_frame = preprocess_frame(frame, background_frames, background_window=50)
+        processed_frame = preprocess_frame(frame, background_frames, background_window=210)
         frames.append(processed_frame)
 
         if len(frames) == num_frames:
@@ -80,8 +88,15 @@ def classify_video(video_path, model, frame_shape, num_frames, class_labels):
 
         pred_class, conf = predictions[frame_idx]
         label = f"{class_labels[pred_class]} ({conf:.2f})"
+
+        # Select color based on classification type
+        if len(class_labels) == 2:  # Binary classification
+            color = binary_colors[class_labels[pred_class]]
+        else:  # Three-class classification
+            color = three_class_colors[class_labels[pred_class]]
+
         cv2.rectangle(frame, (10, 10), (300, 60), (0, 0, 0), -1)
-        cv2.putText(frame, label, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+        cv2.putText(frame, label, (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
 
         out.write(frame)
         frame_idx += 1
